@@ -1,16 +1,21 @@
-const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000/api";
-const API_KEY = process.env.NEXT_PUBLIC_API_KEY ?? "";
+const BASE = "/api/proxy";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     ...options,
     headers: {
       "Content-Type": "application/json",
-      "x-api-key": API_KEY,
       ...(options?.headers ?? {}),
     },
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) {
+    let detail = "Erreur inconnue";
+    try {
+      const body = await res.json();
+      detail = body.detail ?? detail;
+    } catch {}
+    throw new Error(detail);
+  }
   return res.json();
 }
 

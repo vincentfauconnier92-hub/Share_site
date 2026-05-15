@@ -1,22 +1,94 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
-from datetime import date, timedelta, datetime, timezone
+import re
+from datetime import date, datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Literal
 
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from pydantic import BaseModel, Field, field_validator, model_validator
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from sqlalchemy.orm import Session
+
+from backtest.runner import run_backtest
+from core.auth import create_access_token, verify_api_key
+from core.config import settings
 from models.base import get_db
-from models.trade import Trade
-from models.strategy_config import StrategyConfig
 from models.portfolio import Position
 from models.snapshot import PortfolioSnapshot
-from backtest.runner import run_backtest
+from models.strategy_config import StrategyConfig
+from models.trade import Trade
 from trading.portfolio import (
-    _score_config, _compute_realized_pnl, _check_global_stop_loss,
+    GLOBAL_STOP_LOSS_PCT,
+    INITIAL_CAPITAL,
+    MAX_POSITIONS,
+    REBALANCE_THRESHOLD,
+    STOP_LOSS_THRESHOLD,
+    TOP_N,
+    _check_global_stop_loss,
+    _compute_realized_pnl,
+    _score_config,
     compute_portfolio_value,
-    TOP_N, MAX_POSITIONS, REBALANCE_THRESHOLD,
-    INITIAL_CAPITAL, GLOBAL_STOP_LOSS_PCT, STOP_LOSS_THRESHOLD,
 )
-from core.auth import verify_api_key
+
+limiter = Limiter(key_func=get_remote_address)
+
+# ── Constantes de validation ──────────────────────────────────────────
+
+_SYMBOL_RE = re.compile(r"^[A-Z0-9\-\/]{1,15}$")
+_VALID_STRATEGIES = frozenset({"MA Crossover", "RSI", "MACD", "Bollinger Bands"})
+_ALLOWED_PARAMS: dict[str, set[str]] = {
+    "MA Crossover": {"short_window", "long_window"},
+    "RSI": {"period", "oversold", "overbought"},
+    "MACD": {"fast", "slow", "signal_period"},
+    "Bollinger Bands": {"window", "num_std"},
+}
+
+
+def _check_symbol(v: str) -> str:
+    v = v.strip().upper()
+    if not _SYMBOL_RE.match(v):
+        raise ValueError("Symbole invalide — lettres majuscules, chiffres, - ou / uniquement (max 15 chars)")
+    return v
+
+
+def _check_date(v: str) -> str:
+    try:
+        datetime.strptime(v, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError("Format de date invalide — YYYY-MM-DD requis")
+    return v
+
+
+def _check_params(params: dict, strategy_name: str) -> dict:
+    allowed = _ALLOWED_PARAMS.get(strategy_name, set())
+    for key, val in params.items():
+        if key not in allowed:
+            raise ValueError(f"Paramètre '{key}' non autorisé pour '{strategy_name}'")
+        if not isinstance(val, (int, float)) or val <= 0:
+            raise ValueError(f"Paramètre '{key}' doit être un nombre strictement positif")
+    return params
+
+
+# ── Auth (non protégé, rate-limité) ──────────────────────────────────
+
+auth_router = APIRouter()
+
+
+@auth_router.post("/auth/token")
+@limiter.limit("10/minute")
+def get_token(request: Request, x_api_key: str = Header(...)):
+    """Échange la clé API contre un JWT à durée limitée."""
+    if not settings.API_SECRET_KEY or x_api_key != settings.API_SECRET_KEY:
+        raise HTTPException(status_code=401, detail="Clé API invalide")
+    token = create_access_token()
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": settings.JWT_EXPIRE_HOURS * 3600,
+    }
+
+
+# ── Routes protégées ──────────────────────────────────────────────────
 
 router = APIRouter(dependencies=[Depends(verify_api_key)])
 
@@ -24,30 +96,55 @@ router = APIRouter(dependencies=[Depends(verify_api_key)])
 # ── Trades ────────────────────────────────────────────────────────────
 
 @router.get("/trades")
-def list_trades(limit: int = 50, db: Session = Depends(get_db)):
+@limiter.limit("60/minute")
+def list_trades(request: Request, limit: int = Field(default=50, ge=1, le=500), db: Session = Depends(get_db)):
     return db.query(Trade).order_by(Trade.created_at.desc()).limit(limit).all()
 
 
 # ── Stratégies ────────────────────────────────────────────────────────
 
 class StrategyConfigIn(BaseModel):
-    name: str
+    name: Literal["MA Crossover", "RSI", "MACD", "Bollinger Bands"]
     symbol: str
-    asset_type: str
+    asset_type: Literal["stock", "crypto"]
     enabled: bool = True
     params: dict = {}
-    stop_loss_pct: float = 5.0
-    take_profit_pct: float = 10.0
-    position_size_pct: float = 10.0
+    stop_loss_pct: float = Field(default=5.0, ge=0.1, le=50.0)
+    take_profit_pct: float = Field(default=10.0, ge=0.1, le=100.0)
+    position_size_pct: float = Field(default=10.0, ge=0.1, le=10.0)
+
+    @field_validator("symbol")
+    @classmethod
+    def validate_symbol(cls, v: str) -> str:
+        return _check_symbol(v)
+
+    @model_validator(mode="after")
+    def validate_params(self) -> "StrategyConfigIn":
+        if self.params:
+            _check_params(self.params, self.name)
+        return self
+
+
+class ActivateFromScanRequest(BaseModel):
+    symbol: str
+    strategy_name: Literal["MA Crossover", "RSI", "MACD", "Bollinger Bands"]
+    asset_type: Literal["stock", "crypto"] = "stock"
+
+    @field_validator("symbol")
+    @classmethod
+    def validate_symbol(cls, v: str) -> str:
+        return _check_symbol(v)
 
 
 @router.get("/strategies")
-def list_strategies(db: Session = Depends(get_db)):
+@limiter.limit("60/minute")
+def list_strategies(request: Request, db: Session = Depends(get_db)):
     return db.query(StrategyConfig).all()
 
 
 @router.post("/strategies")
-def create_strategy(body: StrategyConfigIn, db: Session = Depends(get_db)):
+@limiter.limit("30/minute")
+def create_strategy(request: Request, body: StrategyConfigIn, db: Session = Depends(get_db)):
     config = StrategyConfig(**body.model_dump())
     db.add(config)
     db.commit()
@@ -55,14 +152,9 @@ def create_strategy(body: StrategyConfigIn, db: Session = Depends(get_db)):
     return config
 
 
-class ActivateFromScanRequest(BaseModel):
-    symbol: str
-    strategy_name: str
-    asset_type: str = "stock"
-
-
 @router.post("/strategies/activate-from-scan")
-def activate_from_scan(body: ActivateFromScanRequest, db: Session = Depends(get_db)):
+@limiter.limit("30/minute")
+def activate_from_scan(request: Request, body: ActivateFromScanRequest, db: Session = Depends(get_db)):
     existing = db.query(StrategyConfig).filter(
         StrategyConfig.symbol == body.symbol,
         StrategyConfig.name == body.strategy_name,
@@ -88,7 +180,8 @@ def activate_from_scan(body: ActivateFromScanRequest, db: Session = Depends(get_
 
 
 @router.patch("/strategies/{strategy_id}")
-def update_strategy(strategy_id: int, body: StrategyConfigIn, db: Session = Depends(get_db)):
+@limiter.limit("30/minute")
+def update_strategy(request: Request, strategy_id: int, body: StrategyConfigIn, db: Session = Depends(get_db)):
     config = db.query(StrategyConfig).filter(StrategyConfig.id == strategy_id).first()
     if not config:
         raise HTTPException(status_code=404, detail="Stratégie introuvable")
@@ -99,7 +192,8 @@ def update_strategy(strategy_id: int, body: StrategyConfigIn, db: Session = Depe
 
 
 @router.delete("/strategies/{strategy_id}")
-def delete_strategy(strategy_id: int, db: Session = Depends(get_db)):
+@limiter.limit("30/minute")
+def delete_strategy(request: Request, strategy_id: int, db: Session = Depends(get_db)):
     config = db.query(StrategyConfig).filter(StrategyConfig.id == strategy_id).first()
     if not config:
         raise HTTPException(status_code=404, detail="Stratégie introuvable")
@@ -111,7 +205,8 @@ def delete_strategy(strategy_id: int, db: Session = Depends(get_db)):
 # ── Portfolio ─────────────────────────────────────────────────────────
 
 @router.get("/portfolio")
-def get_portfolio(db: Session = Depends(get_db)):
+@limiter.limit("30/minute")
+def get_portfolio(request: Request, db: Session = Depends(get_db)):
     positions = db.query(Position).order_by(Position.score.desc()).all()
     configs = db.query(StrategyConfig).filter(StrategyConfig.enabled == True).all()
 
@@ -156,7 +251,8 @@ def get_portfolio(db: Session = Depends(get_db)):
 
 
 @router.get("/portfolio/unrealized")
-def get_unrealized_pnl(db: Session = Depends(get_db)):
+@limiter.limit("30/minute")
+def get_unrealized_pnl(request: Request, db: Session = Depends(get_db)):
     from brokers.alpaca_broker import AlpacaBroker
     from brokers.binance_broker import BinanceBroker
 
@@ -174,7 +270,6 @@ def get_unrealized_pnl(db: Session = Depends(get_db)):
 
     stock_positions = [p for p in positions if p.asset_type == "stock"]
     crypto_positions = [p for p in positions if p.asset_type == "crypto"]
-
     price_map: dict[str, float | None] = {}
 
     if stock_positions:
@@ -235,11 +330,12 @@ def get_unrealized_pnl(db: Session = Depends(get_db)):
 
 
 @router.get("/portfolio/history")
-def get_portfolio_history(limit: int = 500, db: Session = Depends(get_db)):
+@limiter.limit("30/minute")
+def get_portfolio_history(request: Request, limit: int = 500, db: Session = Depends(get_db)):
     snapshots = (
         db.query(PortfolioSnapshot)
         .order_by(PortfolioSnapshot.timestamp.asc())
-        .limit(limit)
+        .limit(min(limit, 1000))
         .all()
     )
     return [
@@ -258,18 +354,45 @@ def get_portfolio_history(limit: int = 500, db: Session = Depends(get_db)):
 
 class BacktestRequest(BaseModel):
     symbol: str
-    asset_type: str
-    strategy_name: str
+    asset_type: Literal["stock", "crypto"]
+    strategy_name: Literal["MA Crossover", "RSI", "MACD", "Bollinger Bands"]
     start_date: str
     end_date: str
     params: dict = {}
-    cash: float = 10_000
+    cash: float = Field(default=10_000, gt=0, le=10_000_000)
+
+    @field_validator("symbol")
+    @classmethod
+    def validate_symbol(cls, v: str) -> str:
+        return _check_symbol(v)
+
+    @field_validator("start_date", "end_date")
+    @classmethod
+    def validate_date(cls, v: str) -> str:
+        return _check_date(v)
+
+    @model_validator(mode="after")
+    def validate_date_range(self) -> "BacktestRequest":
+        start = datetime.strptime(self.start_date, "%Y-%m-%d")
+        end = datetime.strptime(self.end_date, "%Y-%m-%d")
+        if start >= end:
+            raise ValueError("start_date doit être antérieure à end_date")
+        if end.date() > date.today():
+            raise ValueError("end_date ne peut pas être dans le futur")
+        if start < datetime(1990, 1, 1):
+            raise ValueError("Données non disponibles avant 1990")
+        if (end - start).days > 10 * 365:
+            raise ValueError("Période maximale : 10 ans")
+        if self.params:
+            _check_params(self.params, self.strategy_name)
+        return self
 
 
 @router.post("/backtest")
-def launch_backtest(body: BacktestRequest):
+@limiter.limit("20/hour")
+def launch_backtest(request: Request, body: BacktestRequest):
     try:
-        result = run_backtest(
+        return run_backtest(
             symbol=body.symbol,
             asset_type=body.asset_type,
             strategy_name=body.strategy_name,
@@ -278,7 +401,6 @@ def launch_backtest(body: BacktestRequest):
             params=body.params,
             cash=body.cash,
         )
-        return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -309,7 +431,22 @@ PERIODS = {
 class ScanRequest(BaseModel):
     symbols: list[str] = NASDAQ_100
     periods: list[str] = ["1an", "3ans"]
-    cash: float = 10_000
+    cash: float = Field(default=10_000, gt=0, le=10_000_000)
+
+    @field_validator("symbols")
+    @classmethod
+    def validate_symbols(cls, v: list[str]) -> list[str]:
+        if len(v) > 150:
+            raise ValueError("Maximum 150 symboles par scan")
+        return [_check_symbol(s) for s in v]
+
+    @field_validator("periods")
+    @classmethod
+    def validate_periods(cls, v: list[str]) -> list[str]:
+        invalid = [p for p in v if p not in PERIODS]
+        if invalid:
+            raise ValueError(f"Périodes invalides : {invalid}. Valeurs acceptées : {list(PERIODS.keys())}")
+        return v
 
 
 def _run_one(symbol: str, strategy: str, period_key: str, cash: float) -> dict | None:
@@ -340,12 +477,14 @@ def _estimate_scan_duration(n_symbols: int, n_periods: int) -> str:
 
 
 @router.get("/backtest/scan/nasdaq100")
-def get_nasdaq100():
+@limiter.limit("60/minute")
+def get_nasdaq100(request: Request):
     return {"symbols": NASDAQ_100, "count": len(NASDAQ_100)}
 
 
 @router.post("/backtest/scan")
-def scan_backtests(body: ScanRequest):
+@limiter.limit("2/hour")
+def scan_backtests(request: Request, body: ScanRequest):
     tasks = [
         (symbol, strategy, period)
         for symbol in body.symbols
@@ -401,10 +540,22 @@ PARAM_GRIDS = {
 
 class OptimizeRequest(BaseModel):
     symbol: str
-    asset_type: str = "stock"
-    strategy_name: str
+    asset_type: Literal["stock", "crypto"] = "stock"
+    strategy_name: Literal["MA Crossover", "RSI", "MACD", "Bollinger Bands"]
     period: str = "1an"
-    cash: float = 10_000
+    cash: float = Field(default=10_000, gt=0, le=10_000_000)
+
+    @field_validator("symbol")
+    @classmethod
+    def validate_symbol(cls, v: str) -> str:
+        return _check_symbol(v)
+
+    @field_validator("period")
+    @classmethod
+    def validate_period(cls, v: str) -> str:
+        if v not in PERIODS:
+            raise ValueError(f"Période invalide. Valeurs acceptées : {list(PERIODS.keys())}")
+        return v
 
 
 def _run_with_params(symbol: str, asset_type: str, strategy: str,
@@ -421,7 +572,8 @@ def _run_with_params(symbol: str, asset_type: str, strategy: str,
 
 
 @router.post("/backtest/optimize")
-def optimize_strategy(body: OptimizeRequest):
+@limiter.limit("10/hour")
+def optimize_strategy(request: Request, body: OptimizeRequest):
     grid = PARAM_GRIDS.get(body.strategy_name)
     if not grid:
         raise HTTPException(status_code=400, detail=f"Stratégie inconnue : {body.strategy_name}")
