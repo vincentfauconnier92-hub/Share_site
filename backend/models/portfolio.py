@@ -7,7 +7,7 @@ class Position(Base):
     __tablename__ = "positions"
 
     id = Column(Integer, primary_key=True, index=True)
-    symbol = Column(String, nullable=False, unique=True)
+    symbol = Column(String, nullable=False)
     asset_type = Column(String, nullable=False)
     strategy = Column(String, nullable=False)
     quantity = Column(Float, nullable=False)

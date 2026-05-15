@@ -123,13 +123,53 @@ def _compute_realized_pnl(db: Session) -> float:
     return round(revenue - cost, 2)
 
 
+def _compute_unrealized_pnl(positions: list) -> float:
+    """Fetch current prices from brokers and compute unrealized PnL. Returns 0.0 on failure."""
+    if not positions:
+        return 0.0
+    total = 0.0
+    stock_positions = [p for p in positions if p.asset_type == "stock"]
+    crypto_positions = [p for p in positions if p.asset_type == "crypto"]
+    if stock_positions:
+        try:
+            broker = AlpacaBroker()
+            prices = broker.get_latest_prices_batch([p.symbol for p in stock_positions])
+            for p in stock_positions:
+                price = prices.get(p.symbol)
+                if price:
+                    total += (price - p.entry_price) * p.quantity
+        except Exception:
+            pass
+    if crypto_positions:
+        try:
+            broker = BinanceBroker()
+            for p in crypto_positions:
+                try:
+                    price = broker.get_latest_price(p.symbol)
+                    total += (price - p.entry_price) * p.quantity
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return round(total, 2)
+
+
+def compute_portfolio_value(db: Session) -> float:
+    """Total portfolio value = capital initial + P&L réalisé + P&L latent."""
+    realized = _compute_realized_pnl(db)
+    positions = db.query(Position).all()
+    unrealized = _compute_unrealized_pnl(positions)
+    return round(INITIAL_CAPITAL + realized + unrealized, 2)
+
+
 # ── Snapshot ──────────────────────────────────────────────────────────
 
 def take_snapshot(db: Session) -> None:
     positions = db.query(Position).all()
     capital_deployed = sum(p.capital_allocated for p in positions)
     realized_pnl = _compute_realized_pnl(db)
-    portfolio_value = INITIAL_CAPITAL + realized_pnl
+    unrealized_pnl = _compute_unrealized_pnl(positions)
+    portfolio_value = INITIAL_CAPITAL + realized_pnl + unrealized_pnl
 
     snapshot = PortfolioSnapshot(
         portfolio_value=portfolio_value,
@@ -183,12 +223,54 @@ def _close_position(position: Position, db: Session) -> None:
         telegram.alert_error(position.symbol, "vente", str(e))
 
 
+# ── Stop-loss individuel / take-profit ───────────────────────────────
+
+def _check_individual_exits(positions: list, db: Session) -> list[tuple]:
+    """Retourne [(position, reason)] pour les positions ayant atteint leur SL ou TP."""
+    results = []
+    for position in positions:
+        config = db.query(StrategyConfig).filter(
+            StrategyConfig.symbol == position.symbol,
+            StrategyConfig.name == position.strategy,
+        ).first()
+        if not config:
+            continue
+        try:
+            broker = _broker(position.asset_type)
+            current_price = broker.get_latest_price(position.symbol)
+            pnl_pct = (current_price - position.entry_price) / position.entry_price * 100
+            if pnl_pct <= -abs(config.stop_loss_pct):
+                results.append((position, "stop_loss", current_price))
+            elif pnl_pct >= abs(config.take_profit_pct):
+                results.append((position, "take_profit", current_price))
+        except Exception:
+            pass
+    return results
+
+
+def _close_position_at_price(position: Position, current_price: float, db: Session) -> None:
+    """Ferme une position à un prix connu (évite un double appel broker)."""
+    try:
+        broker = _broker(position.asset_type)
+        result = broker.place_order(position.symbol, position.quantity, "sell")
+        pnl = round((current_price - position.entry_price) * position.quantity, 2)
+        _record_trade(db, position.symbol, position.asset_type, "sell",
+                      position.quantity, current_price, position.strategy,
+                      "filled", result["broker_order_id"])
+        db.delete(position)
+        return pnl
+    except Exception as e:
+        _record_trade(db, position.symbol, position.asset_type, "sell",
+                      position.quantity, 0, position.strategy, "failed")
+        telegram.alert_error(position.symbol, "vente", str(e))
+        return None
+
+
 # ── Stop-loss global ──────────────────────────────────────────────────
 
 def _check_global_stop_loss(db: Session) -> bool:
-    """Retourne True si le stop-loss global est déclenché."""
-    realized_pnl = _compute_realized_pnl(db)
-    portfolio_value = INITIAL_CAPITAL + realized_pnl
+    """Retourne True si le stop-loss global est déclenché (P&L réalisé + latent)."""
+    portfolio_value = compute_portfolio_value(db)
     return portfolio_value < STOP_LOSS_THRESHOLD
 
 
@@ -206,15 +288,27 @@ def run_portfolio(db: Session) -> None:
     if _check_global_stop_loss(db):
         positions = db.query(Position).all()
         if positions:
-            realized_pnl = _compute_realized_pnl(db)
-            portfolio_value = INITIAL_CAPITAL + realized_pnl
+            portfolio_value = compute_portfolio_value(db)
             _close_all_positions(db)
             telegram.alert_global_stop_loss(portfolio_value, STOP_LOSS_THRESHOLD, GLOBAL_STOP_LOSS_PCT * 100)
         take_snapshot(db)
         return
 
+    # Stop-loss individuel et take-profit par position
+    current_positions = db.query(Position).all()
+    for position, reason, current_price in _check_individual_exits(current_positions, db):
+        pnl = _close_position_at_price(position, current_price, db)
+        if pnl is not None:
+            telegram.alert_individual_exit(
+                position.symbol, position.strategy,
+                position.quantity, current_price, pnl, reason,
+            )
+    db.flush()
+
     configs = db.query(StrategyConfig).filter(StrategyConfig.enabled == True).all()
     if not configs:
+        db.commit()
+        take_snapshot(db)
         return
 
     # 1. Score tous les actifs

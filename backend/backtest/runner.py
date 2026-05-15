@@ -57,17 +57,21 @@ class _MACDStrategy(Strategy):
     signal_period = 9
 
     def init(self):
-        def _macd(close):
+        def _macd_line(close):
             s = pd.Series(close)
             ema_fast = s.ewm(span=self.fast, adjust=False).mean()
             ema_slow = s.ewm(span=self.slow, adjust=False).mean()
-            macd_line = ema_fast - ema_slow
-            signal_line = macd_line.ewm(span=self.signal_period, adjust=False).mean()
-            return macd_line.values, signal_line.values
+            return (ema_fast - ema_slow).values
 
-        result = self.I(_macd, self.data.Close, overlay=False)
-        self.macd_line = result[0]
-        self.signal_line = result[1]
+        def _signal_line(close):
+            s = pd.Series(close)
+            ema_fast = s.ewm(span=self.fast, adjust=False).mean()
+            ema_slow = s.ewm(span=self.slow, adjust=False).mean()
+            macd = ema_fast - ema_slow
+            return macd.ewm(span=self.signal_period, adjust=False).mean().values
+
+        self.macd_line = self.I(_macd_line, self.data.Close, overlay=False)
+        self.signal_line = self.I(_signal_line, self.data.Close, overlay=False)
 
     def next(self):
         if crossover(self.macd_line, self.signal_line):
@@ -81,15 +85,20 @@ class _BollingerStrategy(Strategy):
     num_std = 2.0
 
     def init(self):
-        def _bands(close):
+        def _lower_band(close):
             s = pd.Series(close)
             mid = s.rolling(self.window).mean()
             std = s.rolling(self.window).std()
-            return (mid - self.num_std * std).values, (mid + self.num_std * std).values
+            return (mid - self.num_std * std).values
 
-        bands = self.I(_bands, self.data.Close, overlay=True)
-        self.lower = bands[0]
-        self.upper = bands[1]
+        def _upper_band(close):
+            s = pd.Series(close)
+            mid = s.rolling(self.window).mean()
+            std = s.rolling(self.window).std()
+            return (mid + self.num_std * std).values
+
+        self.lower = self.I(_lower_band, self.data.Close, overlay=True)
+        self.upper = self.I(_upper_band, self.data.Close, overlay=True)
 
     def next(self):
         if self.data.Close[-1] < self.lower[-1]:

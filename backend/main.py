@@ -7,6 +7,7 @@ import models.snapshot  # enregistre la table PortfolioSnapshot
 import models.portfolio  # enregistre la table Position
 from api.routes import router
 from scheduler import job_runner
+from core.config import settings
 
 
 @asynccontextmanager
@@ -21,8 +22,9 @@ app = FastAPI(title="Trading Bot API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=[settings.FRONTEND_URL],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["*"],
 )
 

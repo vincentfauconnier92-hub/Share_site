@@ -60,5 +60,17 @@ def alert_global_stop_loss(portfolio_value: float, threshold: float, pct: float)
     )
 
 
+def alert_individual_exit(symbol: str, strategy: str, quantity: float, price: float, pnl: float, reason: str) -> None:
+    label = "STOP-LOSS" if reason == "stop_loss" else "TAKE-PROFIT"
+    emoji = "🛑" if reason == "stop_loss" else "🎯"
+    sign = "+" if pnl >= 0 else ""
+    _send(
+        f"{emoji} <b>{label}</b> — {symbol}\n"
+        f"Stratégie : {strategy}\n"
+        f"Quantité : {quantity:.4f} @ {price:.2f}$\n"
+        f"P&L : <b>{sign}{pnl:.2f}$</b>"
+    )
+
+
 def alert_error(symbol: str, action: str, error: str) -> None:
     _send(f"⚠️ <b>Erreur</b> sur {symbol}\nAction : {action}\nDétail : {error}")

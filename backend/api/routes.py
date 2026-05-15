@@ -12,6 +12,7 @@ from models.snapshot import PortfolioSnapshot
 from backtest.runner import run_backtest
 from trading.portfolio import (
     _score_config, _compute_realized_pnl, _check_global_stop_loss,
+    compute_portfolio_value,
     TOP_N, MAX_POSITIONS, REBALANCE_THRESHOLD,
     INITIAL_CAPITAL, GLOBAL_STOP_LOSS_PCT, STOP_LOSS_THRESHOLD,
 )
@@ -150,7 +151,7 @@ def get_portfolio(db: Session = Depends(get_db)):
             "stop_loss_threshold": STOP_LOSS_THRESHOLD,
         },
         "stop_loss_triggered": _check_global_stop_loss(db),
-        "portfolio_value": round(INITIAL_CAPITAL + _compute_realized_pnl(db), 2),
+        "portfolio_value": compute_portfolio_value(db),
     }
 
 
