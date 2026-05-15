@@ -9,7 +9,7 @@ python-dotenv==1.0.1
 
 # Brokers
 alpaca-py==0.33.0
-python-binance==1.0.19
+python-binance==1.0.21
 
 # Trading & backtesting
 backtesting==0.3.3

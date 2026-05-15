@@ -1,0 +1,7 @@
+# Dépendances de développement et CI uniquement — ne pas installer en production.
+# Usage : pip install -r requirements.dev.txt
+#
+# Audit de sécurité des dépendances :
+#   pip-audit --desc
+#
+pip-audit==2.7.3

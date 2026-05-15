@@ -1,7 +1,10 @@
+import logging
 import re
 from datetime import date, datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Literal
+
+_audit = logging.getLogger("trading.audit")
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -78,9 +81,12 @@ auth_router = APIRouter()
 @limiter.limit("10/minute")
 def get_token(request: Request, x_api_key: str = Header(...)):
     """Échange la clé API contre un JWT à durée limitée."""
+    ip = request.client.host if request.client else "unknown"
     if not settings.API_SECRET_KEY or x_api_key != settings.API_SECRET_KEY:
+        _audit.warning("auth.token_denied ip=%s", ip)
         raise HTTPException(status_code=401, detail="Clé API invalide")
     token = create_access_token()
+    _audit.info("auth.token_issued ip=%s expires_h=%d", ip, settings.JWT_EXPIRE_HOURS)
     return {
         "access_token": token,
         "token_type": "bearer",
@@ -149,6 +155,9 @@ def create_strategy(request: Request, body: StrategyConfigIn, db: Session = Depe
     db.add(config)
     db.commit()
     db.refresh(config)
+    _audit.info("strategy.create id=%d name=%s symbol=%s ip=%s",
+                config.id, config.name, config.symbol,
+                request.client.host if request.client else "unknown")
     return config
 
 
@@ -185,9 +194,13 @@ def update_strategy(request: Request, strategy_id: int, body: StrategyConfigIn, 
     config = db.query(StrategyConfig).filter(StrategyConfig.id == strategy_id).first()
     if not config:
         raise HTTPException(status_code=404, detail="Stratégie introuvable")
+    previous = f"name={config.name} symbol={config.symbol} enabled={config.enabled}"
     for key, value in body.model_dump().items():
         setattr(config, key, value)
     db.commit()
+    _audit.info("strategy.update id=%d %s -> name=%s symbol=%s enabled=%s ip=%s",
+                strategy_id, previous, config.name, config.symbol, config.enabled,
+                request.client.host if request.client else "unknown")
     return config
 
 
@@ -197,6 +210,9 @@ def delete_strategy(request: Request, strategy_id: int, db: Session = Depends(ge
     config = db.query(StrategyConfig).filter(StrategyConfig.id == strategy_id).first()
     if not config:
         raise HTTPException(status_code=404, detail="Stratégie introuvable")
+    _audit.warning("strategy.delete id=%d name=%s symbol=%s ip=%s",
+                   strategy_id, config.name, config.symbol,
+                   request.client.host if request.client else "unknown")
     db.delete(config)
     db.commit()
     return {"ok": True}
@@ -485,6 +501,9 @@ def get_nasdaq100(request: Request):
 @router.post("/backtest/scan")
 @limiter.limit("2/hour")
 def scan_backtests(request: Request, body: ScanRequest):
+    _audit.info("scan.start symbols=%d periods=%s ip=%s",
+                len(body.symbols), body.periods,
+                request.client.host if request.client else "unknown")
     tasks = [
         (symbol, strategy, period)
         for symbol in body.symbols
