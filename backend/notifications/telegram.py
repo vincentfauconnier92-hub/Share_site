@@ -1,5 +1,11 @@
+import hashlib
+import logging
+
 import httpx
+
 from core.config import settings
+
+_log = logging.getLogger("trading.telegram")
 
 
 def _send(text: str) -> None:
@@ -73,4 +79,14 @@ def alert_individual_exit(symbol: str, strategy: str, quantity: float, price: fl
 
 
 def alert_error(symbol: str, action: str, error: str) -> None:
-    _send(f"⚠️ <b>Erreur</b> sur {symbol}\nAction : {action}\nDétail : {error}")
+    # Le détail complet est enregistré dans les logs locaux uniquement.
+    # Telegram ne reçoit qu'un identifiant de référence pour éviter d'exposer
+    # des informations sensibles (chemins, stack traces, clés partielles).
+    error_ref = hashlib.sha256(error.encode()).hexdigest()[:10]
+    _log.error("trading.error symbol=%s action=%s ref=%s detail=%s", symbol, action, error_ref, error)
+    _send(
+        f"⚠️ <b>Erreur</b> sur {symbol}\n"
+        f"Action : {action}\n"
+        f"Référence : <code>{error_ref}</code>\n"
+        f"Consultez les logs pour le détail."
+    )

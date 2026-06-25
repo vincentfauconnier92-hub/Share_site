@@ -201,7 +201,7 @@ export default function DashboardPage() {
                   <tr key={p.id} className="border-b border-gray-800 hover:bg-gray-800/40">
                     <td className="px-4 py-3 font-mono font-medium text-emerald-400">{p.symbol}</td>
                     <td className="px-4 py-3 text-gray-300">{p.strategy}</td>
-                    <td className="px-4 py-3">{p.capital_allocated.toFixed(0)}€</td>
+                    <td className="px-4 py-3">${p.capital_allocated.toFixed(0)}</td>
                     <td className="px-4 py-3 w-32"><ScoreBar score={p.score} /></td>
                     <td className="px-4 py-3 text-gray-400 text-xs">{new Date(p.opened_at).toLocaleDateString("fr-FR")}</td>
                   </tr>
